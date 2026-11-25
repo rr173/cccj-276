@@ -1,0 +1,9 @@
+{
+  "event_id": "Q-A-EXAMPLE",
+  "seq": 950,
+  "rev": 1,
+  "type": "quarantine",
+  "source_id": "A",
+  "reason": "原始样本 A 发现污染风险，暂停含 A 来源材料的发放",
+  "note": "release 事件同形，仅 \"type\" 改为 \"release\"；受影响的检测引用会按业务时点重述。"
+}

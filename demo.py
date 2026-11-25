@@ -242,7 +242,11 @@ def main(db_path: str) -> int:
     ledger.close()
 
     # ------------------------------------------------------------------
-    heading("6. 关闭后重开：持久结果与旧解释均在")
+    heading("6. 来源隔离与解除：实际库存 vs 当前可发放量")
+    quarantine_demo(path)
+
+    # ------------------------------------------------------------------
+    heading("7. 关闭后重开：持久结果与旧解释均在")
     reopened = Ledger.open(path)
     show_sample(reopened, "C", at_seq=4)
     print("重开后 DET-R 当前状态:", reopened.get_citation("DET-R")["status"])
@@ -253,6 +257,115 @@ def main(db_path: str) -> int:
     print("\n全部示例断言通过。")
     print(f"可使用 CLI 查询，例如：python3 -m lineage_ledger sample {path} C")
     return 0
+
+
+def quarantine_demo(db_path: str) -> None:
+    """Isolation, release and a corrected source revisal on a small mixture."""
+    ledger = Ledger.open(db_path)
+    ledger.submit_event(
+        {
+            "event_id": "QO-X",
+            "seq": 200,
+            "rev": 1,
+            "type": "original",
+            "sample_id": "X",
+            "base_amount": 3,
+        }
+    )
+    ledger.submit_event(
+        {
+            "event_id": "QO-Y",
+            "seq": 201,
+            "rev": 1,
+            "type": "original",
+            "sample_id": "Y",
+            "base_amount": 5,
+        }
+    )
+    ledger.submit_event(
+        {
+            "event_id": "QM-1",
+            "seq": 202,
+            "rev": 1,
+            "type": "merge",
+            "sources": [
+                {"sample_id": "X", "amount": 1},
+                {"sample_id": "Y", "amount": 2},
+            ],
+            "output": "QMIX",
+        }
+    )
+    show_sample(ledger, "QMIX")
+    assert ledger.sample("QMIX")["releasable"] is True
+
+    print("\n-- X 检出污染风险：隔离来源 X (seq=205) --")
+    ledger.quarantine_source("Q-X", 205, "X", reason="X 原始样本污染风险")
+    show_sample(ledger, "QMIX")
+    mix = ledger.sample("QMIX")
+    # Physical quantity is unchanged; the whole homogeneous mixture is barred.
+    assert mix["available_quantity"] == "3"
+    assert mix["releasable"] is False
+    assert mix["releasable_quantity"] == "0"
+    assert [b["original_id"] for b in mix["blocked_sources"]] == ["X"]
+    # The unrelated Y-only lineage is untouched.
+    assert ledger.sample("Y")["releasable"] is True
+    print("纯 Y 谱系不受影响:", ledger.sample("Y")["available_quantity"], "可发放")
+
+    print("\n-- 时点查询：隔离前 seq=202 仍可发放 --")
+    print("QMIX @202 可发放量:", ledger.sample("QMIX", at_seq=202)["releasable_quantity"])
+    print("QMIX @205 可发放量:", ledger.sample("QMIX", at_seq=205)["releasable_quantity"])
+
+    print("\n-- 检测引用因来源事件重述（只影响 at_seq>=205） --")
+    ledger.add_citation("DET-Q-202", "QMIX", at_seq=202)
+    ledger.add_citation("DET-Q-205", "QMIX", at_seq=205)
+    print("DET-Q-202:", ledger.get_citation("DET-Q-202")["status"])
+    print("DET-Q-205:", ledger.get_citation("DET-Q-205")["status"],
+          ledger.get_citation("DET-Q-205")["reason_code"])
+
+    print("\n-- 修订：污染来源实为 Y，纠正隔离记录 rev2 --")
+    revised = ledger.submit_event(
+        {
+            "event_id": "Q-X",
+            "seq": 205,
+            "rev": 2,
+            "type": "quarantine",
+            "source_id": "Y",
+            "reason": "复核更正：应为 Y",
+        }
+    )
+    print("重算样本:", revised["affected_samples"], "重述检测:", revised["restated_citations"])
+    show_sample(ledger, "QMIX")
+    assert ledger.sample("QMIX")["quarantined_source_ids"] == ["Y"]
+    assert ledger.sample("X")["releasable"] is True
+    assert ledger.get_citation("DET-Q-205", 1)["status"] == "pending"
+    assert ledger.get_citation("DET-Q-205")["status"] == "pending"
+
+    print("\n-- 解除最后一个相关隔离来源 Y (seq=210)：实际库存重新可发放 --")
+    ledger.add_citation("DET-Q-210", "QMIX", at_seq=210)
+    print("解除前 DET-Q-210:", ledger.get_citation("DET-Q-210")["status"])
+    ledger.release_source("R-Y", 210, "Y", reason="复核解除")
+    show_sample(ledger, "QMIX")
+    released = ledger.sample("QMIX")
+    assert released["available_quantity"] == "3"
+    assert released["releasable"] is True
+    assert released["releasable_quantity"] == "3"
+    # at_seq=210 sees the release; the earlier at_seq=205 reference keeps the
+    # business-time interpretation that Y was still quarantined then.
+    assert ledger.get_citation("DET-Q-210")["status"] == "traceable"
+    assert ledger.get_citation("DET-Q-205")["status"] == "pending"
+    print("DET-Q-210 版本史:", ledger.list_citation_versions("DET-Q-210"))
+    print("DET-Q-205 仍为当时判断:",
+          ledger.get_citation("DET-Q-205")["status"])
+
+    print("\n来源记录史（含被修订的旧版本）：")
+    for record in ledger.source_action_history():
+        marker = "当前" if record["is_current"] else "已被修订"
+        print(
+            f"  - seq={record['seq']} {record['event_id']} rev{record['rev']} "
+            f"{record['action']} {record['source_id']} "
+            f"[{marker}] ({record['reason']})"
+        )
+    ledger.close()
 
 
 if __name__ == "__main__":

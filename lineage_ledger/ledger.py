@@ -10,9 +10,12 @@ from .citations import append_explanation
 from .db import connect
 from .engine import (
     affected_closure,
+    effective_source_actions,
     now_iso,
     recompute_closure,
     sample_report,
+    samples_referencing_source,
+    source_action_records,
 )
 from .errors import ConflictRejected, PersistenceClosed, ValidationRejected
 from .normalize import content_hash, normalize_event, output_claims_from_event, refs_from_event
@@ -198,6 +201,23 @@ class Ledger:
                     (event_id, rev, dep["event_id"], dep["seq"]),
                 )
 
+            if event["type"] in {"quarantine", "release"}:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO quarantine_record(
+                        event_id, rev, seq, source_id, action, reason
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        rev,
+                        seq,
+                        event["source_id"],
+                        event["type"],
+                        event["reason"],
+                    ),
+                )
+
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO sample_identity_claim(
@@ -251,6 +271,26 @@ class Ledger:
                 ).fetchall()
                 touched_samples.update(r["sample_id"] for r in old_rows)
 
+            # Quarantine/release has no physical sample ref; the affected set is
+            # every container whose current composition holds a positive amount
+            # of the recorded source (checked against both the new and, on a
+            # revision, the superseded source so a correction retracts it too).
+            source_ids = set()
+            for source_rev in {rev, old_rev} - {None}:
+                source_row = self.conn.execute(
+                    """
+                    SELECT source_id FROM quarantine_record
+                    WHERE event_id = ? AND rev = ?
+                    """,
+                    (event_id, source_rev),
+                ).fetchone()
+                if source_row is not None:
+                    source_ids.add(source_row["source_id"])
+            for source_id in source_ids:
+                touched_samples |= samples_referencing_source(
+                    self.conn, source_id
+                )
+
             citation_ids: set[str] = set()
             if touched_samples:
                 placeholders = ",".join("?" for _ in touched_samples)
@@ -288,6 +328,7 @@ class Ledger:
                 "write_id": write_cur.lastrowid,
                 "affected_event_count": len(affected),
                 "affected_event_ids": sorted(affected),
+                "affected_samples": sorted(touched_samples),
                 "derivation": derivation,
                 "restated_citations": restated,
             }
@@ -393,6 +434,115 @@ class Ledger:
             (citation_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------------------------------------------------- quarantines
+    def record_source_event(
+        self,
+        event_id: str,
+        seq: int,
+        source_id: str,
+        action: str,
+        *,
+        rev: int = 1,
+        reason: str = "",
+        dependencies: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a quarantine or release for an original source at a business seq."""
+        if action not in {"quarantine", "release"}:
+            raise ValidationRejected("action must be 'quarantine' or 'release'")
+        event: dict[str, Any] = {
+            "event_id": event_id,
+            "seq": seq,
+            "rev": rev,
+            "type": action,
+            "source_id": source_id,
+            "reason": reason,
+        }
+        if dependencies is not None:
+            event["dependencies"] = dependencies
+        return self.submit_event(event)
+
+    def quarantine_source(
+        self,
+        event_id: str,
+        seq: int,
+        source_id: str,
+        *,
+        rev: int = 1,
+        reason: str = "",
+        dependencies: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.record_source_event(
+            event_id,
+            seq,
+            source_id,
+            "quarantine",
+            rev=rev,
+            reason=reason,
+            dependencies=dependencies,
+        )
+
+    def release_source(
+        self,
+        event_id: str,
+        seq: int,
+        source_id: str,
+        *,
+        rev: int = 1,
+        reason: str = "",
+        dependencies: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.record_source_event(
+            event_id,
+            seq,
+            source_id,
+            "release",
+            rev=rev,
+            reason=reason,
+            dependencies=dependencies,
+        )
+
+    def source_actions(
+        self, at_seq: int | None = None, source_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Current-revision quarantine/release records effective at a seq."""
+        records = source_action_records(self.conn, at_seq=at_seq)
+        if source_id is not None:
+            records = [r for r in records if r["source_id"] == source_id]
+        return records
+
+    def source_action_history(
+        self, source_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Every stored revision, including superseded and blocked records."""
+        sql = """
+            SELECT q.event_id, q.rev, q.seq, q.source_id, q.action, q.reason,
+                   (h.current_rev = q.rev) AS is_current,
+                   d.status AS derivation_status, d.reason_code AS derivation_reason
+            FROM quarantine_record q
+            LEFT JOIN event_head h ON h.event_id = q.event_id
+            LEFT JOIN event_derivation d ON d.event_id = q.event_id
+        """
+        params: tuple[Any, ...] = ()
+        if source_id is not None:
+            sql += " WHERE q.source_id = ?"
+            params = (source_id,)
+        sql += " ORDER BY q.seq ASC, q.event_id ASC, q.rev ASC"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def source_status(
+        self, source_id: str, at_seq: int | None = None
+    ) -> dict[str, Any]:
+        """Whether a source is currently quarantined and by which record."""
+        actions = effective_source_actions(self.conn, at_seq=at_seq)
+        record = actions.get(source_id)
+        return {
+            "source_id": source_id,
+            "at_seq": at_seq,
+            "status": "quarantined" if record and record["action"] == "quarantine"
+            else "released",
+            "record": record,
+        }
 
     # ---------------------------------------------------------------- queries
     def sample(self, sample_id: str, at_seq: int | None = None) -> dict[str, Any]:

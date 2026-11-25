@@ -109,7 +109,15 @@ def normalize_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str
     seq = require_int(norm.get("seq"), "seq", minimum=0)
     rev = require_int(norm.get("rev"), "rev", minimum=1)
     event_type = norm.get("type")
-    if event_type not in {"original", "split", "merge", "transfer", "discard"}:
+    if event_type not in {
+        "original",
+        "split",
+        "merge",
+        "transfer",
+        "discard",
+        "quarantine",
+        "release",
+    }:
         raise ValidationRejected(f"unsupported event type: {event_type!r}")
 
     norm["event_id"] = event_id
@@ -181,6 +189,16 @@ def normalize_event(conn: sqlite3.Connection, event: dict[str, Any]) -> dict[str
         convert_amount(conn, norm, default_unit=default_unit)
         norm["sample"] = sample
 
+    elif event_type in {"quarantine", "release"}:
+        # A source event is a pure business-time record: it names an original
+        # source and never changes any physical sample quantity.
+        source_id = require_sample_id(norm.get("source_id"), "source_id")
+        reason = norm.get("reason", "")
+        if not isinstance(reason, str):
+            raise ValidationRejected("reason must be a string")
+        norm["source_id"] = source_id
+        norm["reason"] = reason.strip()
+
     # All quantity holders have been normalized to exact BASE fractions.
     if "unit" in norm:
         norm["unit"] = "BASE"
@@ -214,6 +232,10 @@ def refs_from_event(event: dict[str, Any]) -> list[tuple[str, str]]:
         refs.append((event["destination"], "destination"))
     elif t == "discard":
         refs.append((event["sample"], "sample"))
+    elif t in {"quarantine", "release"}:
+        # A source record is deliberately not a natural sample touch: it must
+        # not rewrite the physical lineage chain of any container.
+        pass
     return refs
 
 

@@ -26,9 +26,21 @@ def _sample_text(report: dict[str, Any]) -> str:
         f"样本 {report['sample_id']}"
         + (f" @seq<={report['at_seq']}" if report["at_seq"] is not None else " 当前"),
         f"状态: {report['status']}",
-        f"可用量: {report['available_quantity']} (基础单位, 精确有理数)",
-        "当前余量中的原始来源贡献:",
+        f"实际库存(可用量): {report['available_quantity']} (基础单位, 精确有理数)",
+        f"当前可发放量: {report['releasable_quantity']}"
+        + ("（可发放）" if report["releasable"] else "（不可发放）"),
     ]
+    if not report["releasable"]:
+        lines.append(f"不可发放原因: {report['release_block_reason']}")
+        if report.get("blocked_sources"):
+            lines.append("导致不可发放的原始来源:")
+            for item in report["blocked_sources"]:
+                lines.append(
+                    f"  - {item['original_id']}: 当前贡献 {item['amount']}"
+                    f"（隔离事件 {item['quarantine_event_id']} "
+                    f"rev{item['quarantine_rev']} seq{item['quarantine_seq']}）"
+                )
+    lines.append("当前余量中的原始来源贡献:")
     if report["precise_contributions"]:
         for item in report["precise_contributions"]:
             lines.append(f"  - {item['original_id']}: {item['amount']}")
@@ -90,6 +102,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_events = sub.add_parser("events")
     p_events.add_argument("db")
+
+    p_q = sub.add_parser(
+        "quarantine", help="record a source quarantine (or --release)"
+    )
+    p_q.add_argument("db")
+    p_q.add_argument("event_id")
+    p_q.add_argument("seq", type=int)
+    p_q.add_argument("source_id")
+    p_q.add_argument("--rev", type=int, default=1)
+    p_q.add_argument("--reason", default="")
+    p_q.add_argument("--release", action="store_true")
+
+    p_qs = sub.add_parser("quarantine-status", help="show effective source records")
+    p_qs.add_argument("db")
+    p_qs.add_argument("source_id", nargs="?")
+    p_qs.add_argument("--at-seq", type=int)
+    p_qs.add_argument(
+        "--history", action="store_true", help="include superseded revisions"
+    )
 
     return parser
 
@@ -157,6 +188,32 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "events":
             with Ledger.open(args.db) as ledger:
                 rows = ledger.list_events()
+            _print_json(rows)
+            return 0
+
+        if args.command == "quarantine":
+            with Ledger.open(args.db) as ledger:
+                result = ledger.record_source_event(
+                    args.event_id,
+                    args.seq,
+                    args.source_id,
+                    "release" if args.release else "quarantine",
+                    rev=args.rev,
+                    reason=args.reason,
+                )
+            _print_json(result)
+            return 0
+
+        if args.command == "quarantine-status":
+            with Ledger.open(args.db) as ledger:
+                if args.history:
+                    rows = ledger.source_action_history(args.source_id)
+                elif args.source_id is None:
+                    rows = ledger.source_actions(at_seq=args.at_seq)
+                else:
+                    rows = ledger.source_status(
+                        args.source_id, at_seq=args.at_seq
+                    )
             _print_json(rows)
             return 0
 

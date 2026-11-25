@@ -16,6 +16,18 @@ def _text_report(evaluation: dict[str, Any]) -> str:
     lines.append(f"检测引用 {c['citation_id']} / 样本 {c['sample_id']} / 业务时点 seq<={c['at_seq']}")
     lines.append(f"结论：{evaluation['status_cn']}（{evaluation['status']}）")
     lines.append(f"当时有效可用量：{r['available_quantity']} 基础单位")
+    lines.append(
+        f"当时可发放量：{r['releasable_quantity']} 基础单位"
+        + ("（可发放）" if r["releasable"] else "（不可发放）")
+    )
+    if r.get("blocked_sources"):
+        lines.append("当时导致不可发放的原始来源：")
+        for item in r["blocked_sources"]:
+            lines.append(
+                f"  - {item['original_id']}: {item['amount']} "
+                f"(隔离 {item['quarantine_event_id']} rev{item['quarantine_rev']} "
+                f"seq{item['quarantine_seq']})"
+            )
     if c.get("claimed_amount") is not None:
         lines.append(f"引用声称/核定量：{c['claimed_amount']} 基础单位")
     if r["precise_contributions"]:
@@ -72,6 +84,7 @@ def evaluate_citation(conn: sqlite3.Connection, citation: sqlite3.Row | dict[str
             report.get("latest_touch")
             and report["latest_touch"].get("status") == "blocked"
         ),
+        "releasable_at_reference_time": report["releasable"],
         "claimed_amount_available": True if claimed is None else qty >= claimed,
     }
 
@@ -85,6 +98,13 @@ def evaluate_citation(conn: sqlite3.Connection, citation: sqlite3.Row | dict[str
     elif qty <= 0:
         status = "pending"
         reason_code = "no_quantity_at_reference_time"
+    elif not checks["releasable_at_reference_time"]:
+        status = "pending"
+        reason_code = (
+            "quarantined_source_at_reference_time"
+            if report["release_block_reason"] == "quarantined_source"
+            else "not_releasable_at_reference_time"
+        )
     elif claimed is not None and qty < claimed:
         status = "pending"
         reason_code = "claimed_amount_exceeds_available_at_reference_time"

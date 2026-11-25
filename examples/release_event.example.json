@@ -1,0 +1,8 @@
+{
+  "event_id": "R-A-EXAMPLE",
+  "seq": 951,
+  "rev": 1,
+  "type": "release",
+  "source_id": "A",
+  "reason": "复核确认无污染风险，解除来源 A 的隔离"
+}

@@ -136,6 +136,140 @@ class _Insufficient(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Source quarantine / release interpretation
+# ---------------------------------------------------------------------------
+
+def source_action_records(
+    conn: sqlite3.Connection, at_seq: int | None = None
+) -> list[dict[str, Any]]:
+    """Current-revision quarantine/release records effective at a business point.
+
+    Records are ordered by business ``seq``.  Only the current revision of each
+    stable event is interpreted, so a later revision corrects that business-time
+    operation without erasing the superseded row.  A record whose current
+    revision is blocked (for example by an invalid explicit dependency) does not
+    take effect.
+    """
+    sql = """
+        SELECT q.event_id, q.rev, q.seq, q.source_id, q.action, q.reason
+        FROM quarantine_record q
+        JOIN event_head h
+          ON h.event_id = q.event_id AND h.current_rev = q.rev
+        JOIN event_derivation d
+          ON d.event_id = q.event_id AND d.status = 'valid'
+    """
+    params: tuple[Any, ...] = ()
+    if at_seq is not None:
+        sql += " WHERE q.seq <= ?"
+        params = (at_seq,)
+    sql += " ORDER BY q.seq ASC, q.event_id ASC"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def effective_source_actions(
+    conn: sqlite3.Connection, at_seq: int | None = None
+) -> dict[str, dict[str, Any]]:
+    """Return the latest effective action per original source at a business point."""
+    latest: dict[str, dict[str, Any]] = {}
+    for record in source_action_records(conn, at_seq=at_seq):
+        latest[record["source_id"]] = record
+    return latest
+
+
+def samples_referencing_source(
+    conn: sqlite3.Connection, source_id: str, at_seq: int | None = None
+) -> set[str]:
+    """Every sample that ever received a non-zero amount of ``source_id``.
+
+    Used for citation restatement: a source event can change the release status
+    of a historical reference even if that source has since been fully drained
+    from the container, so this is deliberately broader than the *current*
+    positive composition check.
+    """
+    sql = """
+        SELECT DISTINCT es.sample_id
+        FROM effect_source es
+        JOIN effect e ON e.event_id = es.event_id AND e.sample_id = es.sample_id
+        WHERE es.original_id = ?
+    """
+    params: tuple[Any, ...] = (source_id,)
+    if at_seq is not None:
+        sql += " AND e.seq <= ?"
+        params += (at_seq,)
+    return {row["sample_id"] for row in conn.execute(sql, params).fetchall()}
+
+
+def release_assessment(
+    conn: sqlite3.Connection,
+    sample_id: str,
+    state: dict[str, Any],
+    status: str,
+    at_seq: int | None = None,
+) -> dict[str, Any]:
+    """Decide whether the whole (uniformly mixed) sample may currently be released.
+
+    Quarantine never changes physical quantity.  If any original source with a
+    non-zero current contribution is quarantined at the queried business point,
+    the entire homogeneous sample is non-releasable even though its actual
+    inventory remains on the books.
+    """
+    actions = effective_source_actions(conn, at_seq=at_seq)
+    blocked_sources: list[dict[str, Any]] = []
+    for original_id, amount in sorted(state["composition"].items()):
+        if amount <= 0:
+            continue
+        record = actions.get(original_id)
+        if record is None or record["action"] != "quarantine":
+            continue
+        blocked_sources.append(
+            {
+                "original_id": original_id,
+                "amount": q_to_str(amount),
+                "numerator": str(amount.numerator),
+                "denominator": str(amount.denominator),
+                "quarantine_event_id": record["event_id"],
+                "quarantine_rev": record["rev"],
+                "quarantine_seq": record["seq"],
+                "reason": record["reason"],
+            }
+        )
+
+    if status == "blocked":
+        reason = "lineage_blocked"
+    elif status == "not_formed":
+        reason = "not_formed"
+    elif status == "exhausted":
+        reason = "no_available_quantity"
+    elif status == "invalid_negative":
+        reason = "invalid_negative_quantity"
+    elif state["quantity"] <= 0:
+        reason = "no_available_quantity"
+    elif blocked_sources:
+        reason = "quarantined_source"
+    else:
+        reason = None
+
+    releasable = reason is None
+    releasable_quantity = state["quantity"] if releasable else Fraction(0, 1)
+
+    effective_records = [
+        dict(record, status=record["action"])
+        for record in source_action_records(conn, at_seq=at_seq)
+    ]
+    return {
+        "sample_id": sample_id,
+        "at_seq": at_seq,
+        "releasable": releasable,
+        "releasable_quantity": releasable_quantity,
+        "reason": reason,
+        "blocked_sources": blocked_sources,
+        "quarantined_source_ids": [b["original_id"] for b in blocked_sources],
+        "effective_source_records": effective_records,
+    }
+
+
+
+# ---------------------------------------------------------------------------
 # Affected lineage closure
 # ---------------------------------------------------------------------------
 
@@ -457,6 +591,11 @@ def derive_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any]:
             qty = Fraction(event["base_amount"], 1)
             add_delta(event["sample_id"], qty, {event["sample_id"]: qty})
 
+        elif t in {"quarantine", "release"}:
+            # Pure source-level decision: no physical effect is written, so
+            # inventory and pre-quarantine detection interpretation are untouched.
+            pass
+
         elif t == "discard":
             sid = event["sample"]
             # Normalized amount is an exact Fraction string such as "3/2".
@@ -612,6 +751,10 @@ def sample_report(
     else:
         status = "available"
 
+    release = release_assessment(
+        conn, sample_id, state, status, at_seq=at_seq
+    )
+
     contributions = [
         {
             "original_id": original_id,
@@ -666,6 +809,14 @@ def sample_report(
         "at_seq": at_seq,
         "status": status,
         "formed": state["formed"],
+        "releasable": release["releasable"],
+        "releasable_quantity": q_to_str(release["releasable_quantity"]),
+        "releasable_numerator": str(release["releasable_quantity"].numerator),
+        "releasable_denominator": str(release["releasable_quantity"].denominator),
+        "release_block_reason": release["reason"],
+        "blocked_sources": release["blocked_sources"],
+        "quarantined_source_ids": release["quarantined_source_ids"],
+        "effective_source_records": release["effective_source_records"],
         "available_quantity": q_to_str(state["quantity"]),
         "available_numerator": str(state["quantity"].numerator),
         "available_denominator": str(state["quantity"].denominator),

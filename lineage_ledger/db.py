@@ -119,6 +119,21 @@ CREATE TABLE IF NOT EXISTS event_upstream (
 );
 CREATE INDEX IF NOT EXISTS idx_upstream_up ON event_upstream(upstream_event_id);
 
+-- Source quarantine / release records. Every revision is retained; queries
+-- join event_head so only the current revision of each record is interpreted.
+CREATE TABLE IF NOT EXISTS quarantine_record (
+    event_id TEXT NOT NULL,
+    rev INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    source_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('quarantine', 'release')),
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (event_id, rev)
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_source_seq
+    ON quarantine_record(source_id, seq);
+CREATE INDEX IF NOT EXISTS idx_quarantine_seq ON quarantine_record(seq);
+
 CREATE TABLE IF NOT EXISTS citation (
     citation_id TEXT PRIMARY KEY,
     sample_id TEXT NOT NULL,
