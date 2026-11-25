@@ -172,6 +172,46 @@ CREATE TABLE IF NOT EXISTS ledger_write (
     content_hash TEXT,
     committed_at TEXT NOT NULL
 );
+
+-- Sample reservations are pure capacity holds. They never write effects, so
+-- physical inventory and source-traceability results are unchanged until a
+-- reservation is fulfilled (which emits a normal discard withdrawal event).
+CREATE TABLE IF NOT EXISTS reservation (
+    request_id TEXT PRIMARY KEY,
+    sample_id TEXT NOT NULL,
+    amount_num TEXT NOT NULL,
+    amount_den TEXT NOT NULL,
+    remaining_num TEXT NOT NULL,
+    remaining_den TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'fulfilled', 'cancelled', 'closed')),
+    content_hash TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_sample ON reservation(sample_id);
+CREATE INDEX IF NOT EXISTS idx_reservation_status ON reservation(status);
+
+-- Idempotent operations against a reservation. Each fulfill/cancel keeps the
+-- stable operation_id semantics used by event submissions: identical retries
+-- are no-ops, a reused id with different payload is a conflict.
+CREATE TABLE IF NOT EXISTS reservation_operation (
+    operation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    op_type TEXT NOT NULL CHECK (op_type IN ('fulfill', 'cancel')),
+    seq INTEGER,
+    amount_num TEXT NOT NULL,
+    amount_den TEXT NOT NULL,
+    applied_num TEXT NOT NULL,
+    applied_den TEXT NOT NULL,
+    withdrawal_event_id TEXT,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (request_id) REFERENCES reservation(request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_op_request ON reservation_operation(request_id);
+CREATE INDEX IF NOT EXISTS idx_reservation_op_event ON reservation_operation(withdrawal_event_id);
 """
 
 

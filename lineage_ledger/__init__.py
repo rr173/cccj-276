@@ -1,5 +1,5 @@
 """Persistent exact-rational sample lineage ledger."""
-from .errors import ConflictRejected, LedgerError, ValidationRejected
+from .errors import ConflictRejected, LedgerError, PersistenceClosed, ValidationRejected
 from .ledger import Ledger
 
 __all__ = [
@@ -7,4 +7,5 @@ __all__ = [
     "LedgerError",
     "ValidationRejected",
     "ConflictRejected",
+    "PersistenceClosed",
 ]

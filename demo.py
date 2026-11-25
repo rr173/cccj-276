@@ -246,7 +246,11 @@ def main(db_path: str) -> int:
     quarantine_demo(path)
 
     # ------------------------------------------------------------------
-    heading("7. 关闭后重开：持久结果与旧解释均在")
+    heading("7. 样本预约与履约：只占容量、不动实物，缺口显式报告")
+    reservation_demo(path)
+
+    # ------------------------------------------------------------------
+    heading("8. 关闭后重开：持久结果与旧解释均在")
     reopened = Ledger.open(path)
     show_sample(reopened, "C", at_seq=4)
     print("重开后 DET-R 当前状态:", reopened.get_citation("DET-R")["status"])
@@ -365,6 +369,101 @@ def quarantine_demo(db_path: str) -> None:
             f"{record['action']} {record['source_id']} "
             f"[{marker}] ({record['reason']})"
         )
+    ledger.close()
+
+
+def reservation_demo(db_path: str) -> None:
+    """Reservation, cancel, fulfillment and explicit shortfall reporting."""
+    ledger = Ledger.open(db_path)
+    ledger.submit_event(
+        {
+            "event_id": "RO-Z",
+            "seq": 300,
+            "rev": 1,
+            "type": "original",
+            "sample_id": "Z",
+            "base_amount": 10,
+        }
+    )
+    print("-- 预约前 Z 实际库存与可预约量 --")
+    show_sample(ledger, "Z")
+
+    print("\n-- 方案甲/乙分别预约 4 和 3；预约不写 effect，物理库存不变 --")
+    r1 = ledger.reserve_sample("RES-Z-甲", "Z", 4, note="方案甲")
+    r2 = ledger.reserve_sample("RES-Z-乙", "Z", 3, note="方案乙")
+    print("甲:", r1["request_outcome"], "剩余可预约:",
+          ledger.reservable_quantity("Z")["bookable_quantity"])
+    assert ledger.sample("Z")["available_quantity"] == "10"
+    assert ledger.reservable_quantity("Z")["reserved_quantity"] == "7"
+
+    print("\n-- 重送同一 request_id：幂等 no-op，不重复占量 --")
+    retry = ledger.reserve_sample("RES-Z-甲", "Z", 4, note="方案甲")
+    assert retry["request_outcome"] == "duplicate_noop"
+    print("重送结果:", retry["request_outcome"])
+    try:
+        ledger.reserve_sample("RES-Z-甲", "Z", 5, note="方案甲改量")
+    except ConflictRejected as exc:
+        print("同号异内容拒绝 ->", exc)
+
+    print("\n-- 超量预约必须整单拒绝（可预约只剩 3，申请 4）--")
+    try:
+        ledger.reserve_sample("RES-Z-丙", "Z", 4)
+    except ConflictRejected as exc:
+        print("整单拒绝 ->", exc)
+    assert len(ledger.list_reservations()) == 2
+
+    print("\n-- 方案甲履约 1/2：同一事务写 discard 实物取用并扣减预约剩余量 --")
+    fulfilled = ledger.fulfill_reservation(
+        "RES-Z-甲", 301, "1/2", operation_id="FUL-甲-1"
+    )
+    print("履约取用事件:", fulfilled["withdrawal_event"]["event_id"],
+          fulfilled["withdrawal_event"]["derivation"]["status"])
+    assert ledger.sample("Z")["available_quantity"] == "19/2"
+    assert ledger.get_reservation("RES-Z-甲")["remaining_quantity"] == "7/2"
+
+    print("\n-- 取消方案乙的 1 个单位，容量立即释放 --")
+    ledger.cancel_reservation("RES-Z-乙", amount=1, operation_id="CAN-乙-1")
+    assert ledger.get_reservation("RES-Z-乙")["remaining_quantity"] == "2"
+
+    print("\n-- 预约之外的实际取用导致库存不足：预约原量保留，缺口显式报告 --")
+    ledger.submit_event(
+        {
+            "event_id": "RD-Z",
+            "seq": 302,
+            "rev": 1,
+            "type": "discard",
+            "sample": "Z",
+            "amount": 8,
+        }
+    )
+    coverage = ledger.reservation_coverage_report("Z")[0]
+    print("实际库存:", coverage["available_quantity"],
+          "可发放:", coverage["releasable_quantity"],
+          "已预约:", coverage["reserved_quantity"])
+    print("未覆盖总量:", coverage["uncovered_total"], "原因:", coverage["shortfall_reasons"])
+    for item in coverage["affected_reservations"]:
+        print(
+            f"  受影响预约 {item['request_id']}: 剩余 {item['remaining_amount']}，"
+            f"已覆盖 {item['covered_quantity']}，未覆盖 {item['uncovered_quantity']}"
+        )
+    assert coverage["fully_covered"] is False
+    # Reservation amounts were never silently rewritten.
+    assert ledger.get_reservation("RES-Z-甲")["remaining_quantity"] == "7/2"
+    assert ledger.get_reservation("RES-Z-乙")["remaining_quantity"] == "2"
+
+    print("\n-- 来源隔离同样造成未覆盖，并阻断隔离期履约 --")
+    ledger.quarantine_source("RQ-Z", 303, "Z", reason="污染风险")
+    blocked = ledger.reservation_coverage_report("Z")[0]
+    print("隔离后未覆盖总量:", blocked["uncovered_total"],
+          "原因:", blocked["shortfall_reasons"])
+    try:
+        ledger.fulfill_reservation(
+            "RES-Z-乙", 304, 1, operation_id="FUL-乙-BLOCKED"
+        )
+    except ConflictRejected as exc:
+        print("隔离期履约拒绝 ->", exc)
+    ledger.release_source("RR-Z", 305, "Z", reason="复核解除")
+    print("解除后可发放量:", ledger.sample("Z")["releasable_quantity"])
     ledger.close()
 
 

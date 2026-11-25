@@ -62,6 +62,27 @@ def _sample_text(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _reservable_text(report: dict[str, Any]) -> str:
+    lines = [
+        f"样本 {report['sample_id']} 预约容量",
+        f"实际库存: {report['available_quantity']} 基础单位",
+        f"当前可发放量: {report['releasable_quantity']}"
+        + ("（可发放）" if report["releasable"] else f"（不可发放: {report['release_block_reason']}）"),
+        f"已预约未履约量: {report['reserved_quantity']}",
+        f"剩余可预约量: {report['bookable_quantity']}",
+        f"预约是否全部被库存覆盖: {'是' if report['fully_covered'] else '否'}",
+    ]
+    if report["uncovered_total"] != "0":
+        lines.append(f"未覆盖总量: {report['uncovered_total']}")
+        lines.append("受影响预约:")
+        for item in report["affected_reservations"]:
+            lines.append(
+                f"  - {item['request_id']}: 剩余 {item['remaining_amount']}，"
+                f"未覆盖 {item['uncovered_quantity']}"
+            )
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lineage-ledger")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -121,6 +142,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_qs.add_argument(
         "--history", action="store_true", help="include superseded revisions"
     )
+
+    p_res = sub.add_parser(
+        "reserve", help="reserve an exact amount of releasable sample"
+    )
+    p_res.add_argument("db")
+    p_res.add_argument("request_id")
+    p_res.add_argument("sample_id")
+    p_res.add_argument("amount", help="exact BASE quantity, e.g. 2 or 1/3")
+    p_res.add_argument("--note", default="")
+    p_res.add_argument("--metadata-json", default="{}")
+
+    p_cancel = sub.add_parser(
+        "reservation-cancel", help="cancel part or all of an open reservation"
+    )
+    p_cancel.add_argument("db")
+    p_cancel.add_argument("request_id")
+    p_cancel.add_argument("--amount", help="omit to cancel the full remaining amount")
+    p_cancel.add_argument("--operation-id", required=True)
+    p_cancel.add_argument("--reason", default="")
+
+    p_fulfill = sub.add_parser(
+        "reservation-fulfill",
+        help="register an actual withdrawal against a reservation",
+    )
+    p_fulfill.add_argument("db")
+    p_fulfill.add_argument("request_id")
+    p_fulfill.add_argument("seq", type=int)
+    p_fulfill.add_argument("amount")
+    p_fulfill.add_argument("--operation-id", required=True)
+    p_fulfill.add_argument("--withdrawal-event-id")
+    p_fulfill.add_argument("--reason", default="")
+
+    p_book = sub.add_parser(
+        "reservable", help="show remaining quantity open for reservation"
+    )
+    p_book.add_argument("db")
+    p_book.add_argument("sample_id")
+    p_book.add_argument("--json", action="store_true")
+
+    p_list = sub.add_parser("reservations", help="list reservations")
+    p_list.add_argument("db")
+    p_list.add_argument("--sample-id")
+    p_list.add_argument(
+        "--status", choices=["active", "fulfilled", "cancelled", "closed"]
+    )
+    p_list.add_argument("--no-coverage", action="store_true")
+
+    p_get = sub.add_parser("reservation", help="show one reservation with operations")
+    p_get.add_argument("db")
+    p_get.add_argument("request_id")
+
+    p_cov = sub.add_parser(
+        "reservation-coverage",
+        help="report reservations uncovered by later stock changes",
+    )
+    p_cov.add_argument("db")
+    p_cov.add_argument("sample_id", nargs="?")
 
     return parser
 
@@ -214,6 +292,74 @@ def main(argv: list[str] | None = None) -> int:
                     rows = ledger.source_status(
                         args.source_id, at_seq=args.at_seq
                     )
+            _print_json(rows)
+            return 0
+
+        if args.command == "reserve":
+            metadata = json.loads(args.metadata_json)
+            with Ledger.open(args.db) as ledger:
+                result = ledger.reserve_sample(
+                    args.request_id,
+                    args.sample_id,
+                    args.amount,
+                    note=args.note,
+                    metadata=metadata,
+                )
+            _print_json(result)
+            return 0
+
+        if args.command == "reservation-cancel":
+            with Ledger.open(args.db) as ledger:
+                result = ledger.cancel_reservation(
+                    args.request_id,
+                    amount=args.amount,
+                    operation_id=args.operation_id,
+                    reason=args.reason,
+                )
+            _print_json(result)
+            return 0
+
+        if args.command == "reservation-fulfill":
+            with Ledger.open(args.db) as ledger:
+                result = ledger.fulfill_reservation(
+                    args.request_id,
+                    args.seq,
+                    args.amount,
+                    operation_id=args.operation_id,
+                    withdrawal_event_id=args.withdrawal_event_id,
+                    reason=args.reason,
+                )
+            _print_json(result)
+            return 0
+
+        if args.command == "reservable":
+            with Ledger.open(args.db) as ledger:
+                report = ledger.reservable_quantity(args.sample_id)
+            if args.json:
+                _print_json(report)
+            else:
+                print(_reservable_text(report))
+            return 0
+
+        if args.command == "reservations":
+            with Ledger.open(args.db) as ledger:
+                rows = ledger.list_reservations(
+                    sample_id=args.sample_id,
+                    status=args.status,
+                    with_coverage=not args.no_coverage,
+                )
+            _print_json(rows)
+            return 0
+
+        if args.command == "reservation":
+            with Ledger.open(args.db) as ledger:
+                row = ledger.get_reservation(args.request_id)
+            _print_json(row)
+            return 0
+
+        if args.command == "reservation-coverage":
+            with Ledger.open(args.db) as ledger:
+                rows = ledger.reservation_coverage_report(args.sample_id)
             _print_json(rows)
             return 0
 

@@ -25,6 +25,25 @@ python3 -m lineage_ledger quarantine-status /tmp/lineage_demo.sqlite3 --history
 python3 -m lineage_ledger sample /tmp/lineage_demo.sqlite3 QMIX --at-seq 205
 ```
 
+CLI 样本预约与履约：
+
+```bash
+# 按精确数量预约可发放样本（全量接受或整单拒绝；同 request_id 重送幂等）
+python3 -m lineage_ledger reserve /tmp/lineage_demo.sqlite3 RES-1 C 1/3 --note 方案甲
+# 查询剩余可预约量（可发放量 - 未履约预约量）
+python3 -m lineage_ledger reservable /tmp/lineage_demo.sqlite3 C
+# 取消未履约预约（可部分取消；省略 amount 即取消全部剩余量）
+python3 -m lineage_ledger reservation-cancel /tmp/lineage_demo.sqlite3 RES-1 \
+    --operation-id CAN-1 --amount 1/6
+# 登记实际取用为履约：同一事务写 discard 取用事件并扣减预约剩余量
+python3 -m lineage_ledger reservation-fulfill /tmp/lineage_demo.sqlite3 RES-1 \
+    300 1/6 --operation-id FUL-1
+# 列出预约、查看单条预约（含履约/取消操作史）、缺口覆盖报告
+python3 -m lineage_ledger reservations /tmp/lineage_demo.sqlite3
+python3 -m lineage_ledger reservation /tmp/lineage_demo.sqlite3 RES-1
+python3 -m lineage_ledger reservation-coverage /tmp/lineage_demo.sqlite3 C
+```
+
 CLI 提交事件：
 
 ```bash
@@ -77,6 +96,25 @@ python3 -m lineage_ledger submit /path/to/ledger.sqlite3 /path/to/event.json
     不受影响。来源事件迟到或修订后，发放判断按修正后的谱系重新计算。
 - **原子性**：一次提交中的事件版本、当前头、引用/声明、局部重算、检测重述和
   `ledger_write` 在同一个 SQLite 事务中提交；重开不会得到半版派生结果。
+- **样本预约（reservation）与履约（fulfillment）**：
+  - 预约是**纯容量占用**：只写 `reservation` 表，**不产生任何 effect**，因此不改变
+    物理库存、来源组成、隔离判断或既有检测解释。可预约量 =
+    当前可发放量 − 同一样本所有未履约（active）预约的剩余量。
+  - **全量接受或明确拒绝**：申请量超过剩余可预约量、样本未形成/谱系阻断/被隔离而
+    不可发放时，整单拒绝（`ConflictRejected`），不会部分占量或留下残单。
+  - **稳定请求标识**：`request_id` 相同且规范化内容相同的重送返回
+    `duplicate_noop`，不重复占量；同一 `request_id` 对应不同内容（样本、数量、备注、
+    元数据）一律拒绝（`ConflictRejected`）。
+  - **取消与履约受原预约剩余量约束**：超过剩余量的取消/履约直接拒绝，不会变成负数。
+    取消可部分进行；履约把实际取用登记为一笔常规 `discard` 事件，与预约扣减在
+    **同一事务**提交，二者不会出现半完成状态。
+  - 履约/取消操作自带稳定 `operation_id`：同号同内容重送为幂等 no-op，同号异内容
+    拒绝。隔离期间样本不可发放，履约同样被拒绝且不写取用事件。
+  - **缺口显式报告、绝不伪造库存**：预约原量永久保留。之后若因实际取用或来源隔离
+    导致可发放库存低于未履约预约总量，`reservation_coverage_report` 按先到先得
+    （FIFO）列出每个受影响预约的已覆盖/未覆盖精确数量、未覆盖总量与原因
+    （`insufficient_releasable_quantity` / `quarantined_source` 等），
+    不会静默改写预约，也不会调账补足库存。
 
 ## Python API
 
@@ -124,6 +162,18 @@ ledger.release_source("R-B", 6, "B", reason="解除")
 print(ledger.sample("C")["releasable"])           # True，剩余库存重新可发放
 print(ledger.sample("C", at_seq=4)["releasable"]) # True，隔离前时点
 print(ledger.source_status("A", at_seq=5))        # 该时点的有效来源记录
+
+# 样本预约 / 取消 / 履约（精确 BASE 数量，支持整数、"1/3"、{"num","den"}）
+reserved = ledger.reserve_sample("RES-1", "C", "1/3", note="方案甲")
+print(reserved["request_outcome"])                # accepted | duplicate_noop
+print(ledger.reservable_quantity("C")["bookable_quantity"])  # 剩余可预约量
+
+ledger.cancel_reservation("RES-1", amount="1/6", operation_id="CAN-1")
+ledger.fulfill_reservation("RES-1", 300, "1/6", operation_id="FUL-1")
+print(ledger.get_reservation("RES-1")["remaining_quantity"])  # 履约/取消后的剩余量
+# 库存后来不足时：预约原量保留，显式报告受影响预约与未覆盖总量
+for gap in ledger.reservation_coverage_report("C"):
+    print(gap["uncovered_total"], gap["affected_reservations"])
 ledger.close()
 ```
 
@@ -176,3 +226,7 @@ ledger.close()
 - `quarantine_record`：按稳定事件/修订保存的来源隔离与解除记录（不产生 effect）
 - `event_upstream`：当前解释的局部证据边
 - `citation` / `citation_explanation`：检测引用及不可变解释版本
+- `reservation`：样本预约主表（原始预约量、剩余量、状态、内容哈希）；纯容量占用，
+  不写 effect，不改变物理库存
+- `reservation_operation`：预约的履约/取消操作记录（稳定 `operation_id`、精确数量、
+  履约对应的取用事件 ID），支撑操作级幂等与审计
