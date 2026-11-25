@@ -1,0 +1,11 @@
+{
+  "event_id": "CLI-SPLIT-EXAMPLE",
+  "seq": 900,
+  "rev": 1,
+  "type": "split",
+  "source": "A",
+  "outputs": [
+    {"sample_id": "CLI-CHILD", "amount": "1/2"}
+  ],
+  "note": "Exact rational amount; decimals such as \"0.25\" are also accepted as strings."
+}
