@@ -25,6 +25,14 @@ python3 -m lineage_ledger quarantine-status /tmp/lineage_demo.sqlite3 --history
 python3 -m lineage_ledger sample /tmp/lineage_demo.sqlite3 QMIX --at-seq 205
 ```
 
+审计对比（只读命令，不改动原库）：给定样本、两个入账截点（`ledger_write.write_id`，
+含该笔写入，0 表示空台账）与业务序号区间 `[起点, 终点)`，输出两次解释结论不同的
+时段及前后结论：
+
+```bash
+python3 -m lineage_ledger audit-diff /tmp/lineage_demo.sqlite3 C 4 9 0 50
+```
+
 CLI 样本预约与履约：
 
 ```bash
@@ -96,6 +104,20 @@ python3 -m lineage_ledger submit /path/to/ledger.sqlite3 /path/to/event.json
     不受影响。来源事件迟到或修订后，发放判断按修正后的谱系重新计算。
 - **原子性**：一次提交中的事件版本、当前头、引用/声明、局部重算、检测重述和
   `ledger_write` 在同一个 SQLite 事务中提交；重开不会得到半版派生结果。
+- **审计对比（audit-diff）**：只读命令，无需事先登记审计对象或制作快照。给定两个
+  入账截点（`ledger_write.write_id`，含该笔写入，0 表示空台账；从早到晚给出，可相同）
+  与业务序号区间 `[from_seq, to_seq)`，重建样本相关谱系在两个截点的解释并输出结论
+  不同的时段及前后结论：
+  - 每个截点只使用当时已入账的记录，取同一事件当时最新的修订；当时已登记的样本
+    身份声明即使来自失效或被替换的版本也仍有效。
+  - 依现有谱系、阻断和来源隔离规则按业务序号解释；某序号上的事件在该点已生效。
+    预约占量不是物理变化，不计入结论；履约产生的取用事件正常计入。
+  - 对比样本状态、精确库存、各原始来源的精确贡献、可发放量及阻止发放的来源 ID。
+    只输出有差异的区段（按业务序号排序）；前后两侧结论分别不变时，跨越相邻边界
+    合并为一个区段；无差异返回空区段列表。
+  - 截点不存在或倒序、业务区间不是递增的非负整数范围时报错。
+  - 查询不改动原库（CLI 以 SQLite 只读模式打开）；只扫描样本相关谱系，不复制整库，
+    按分段常数结论计算，不逐个枚举区间内的业务序号。
 - **样本预约（reservation）与履约（fulfillment）**：
   - 预约是**纯容量占用**：只写 `reservation` 表，**不产生任何 effect**，因此不改变
     物理库存、来源组成、隔离判断或既有检测解释。可预约量 =
@@ -174,6 +196,11 @@ print(ledger.get_reservation("RES-1")["remaining_quantity"])  # 履约/取消后
 # 库存后来不足时：预约原量保留，显式报告受影响预约与未覆盖总量
 for gap in ledger.reservation_coverage_report("C"):
     print(gap["uncovered_total"], gap["affected_reservations"])
+
+# 审计对比：样本 C 在入账截点 write_id 4 与 9 之间、业务序号 [0, 50) 的结论差异
+diff = ledger.audit_sample_diff("C", 4, 9, 0, 50)
+for seg in diff["segments"]:
+    print(seg["from_seq"], seg["to_seq"], seg["before"], seg["after"])
 ledger.close()
 ```
 

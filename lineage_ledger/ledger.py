@@ -9,6 +9,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from .audit import sample_diff_between_writes
 from .citations import append_explanation
 from .db import connect
 from .engine import (
@@ -1105,6 +1106,28 @@ class Ledger:
             sample_id = self._require_id(sample_id, "sample_id")
             return [reservation_coverage(self.conn, sample_id)]
         return all_coverage(self.conn)
+
+    # ------------------------------------------------------------------ audit
+    def audit_sample_diff(
+        self,
+        sample_id: str,
+        from_write_id: int,
+        to_write_id: int,
+        from_seq: int,
+        to_seq: int,
+    ) -> dict[str, Any]:
+        """Read-only diff of a sample's conclusions between two write cutoffs.
+
+        Compares the ledger's interpretation of ``sample_id`` as of
+        ``from_write_id`` (earlier) and ``to_write_id`` (later, inclusive;
+        0 means the empty ledger) over the business interval
+        ``[from_seq, to_seq)``, and returns only the segments where the
+        conclusions differ.  The query never modifies the database.
+        """
+        self._check_open()
+        return sample_diff_between_writes(
+            self.conn, sample_id, from_write_id, to_write_id, from_seq, to_seq
+        )
 
     # ---------------------------------------------------------------- queries
     def sample(self, sample_id: str, at_seq: int | None = None) -> dict[str, Any]:

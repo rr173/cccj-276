@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from . import ConflictRejected, Ledger, ValidationRejected
+from .audit import sample_diff_between_writes
+from .db import connect_readonly
 
 
 def _print_json(value: Any) -> None:
@@ -200,6 +202,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_cov.add_argument("db")
     p_cov.add_argument("sample_id", nargs="?")
 
+    p_audit = sub.add_parser(
+        "audit-diff",
+        help=(
+            "read-only: list the business-seq segments in [from_seq, to_seq) "
+            "where a sample's conclusions differ between two write cutoffs"
+        ),
+    )
+    p_audit.add_argument("db")
+    p_audit.add_argument("sample_id")
+    p_audit.add_argument(
+        "from_write_id",
+        type=int,
+        help="earlier write cutoff (ledger_write.write_id, inclusive; 0 = empty ledger)",
+    )
+    p_audit.add_argument(
+        "to_write_id",
+        type=int,
+        help="later write cutoff (ledger_write.write_id, inclusive)",
+    )
+    p_audit.add_argument("from_seq", type=int, help="business interval start (inclusive)")
+    p_audit.add_argument("to_seq", type=int, help="business interval end (exclusive)")
+
     return parser
 
 
@@ -361,6 +385,24 @@ def main(argv: list[str] | None = None) -> int:
             with Ledger.open(args.db) as ledger:
                 rows = ledger.reservation_coverage_report(args.sample_id)
             _print_json(rows)
+            return 0
+
+        if args.command == "audit-diff":
+            # Strictly read-only: the original database is opened with
+            # SQLite's read-only mode and only TEMP tables are used.
+            conn = connect_readonly(args.db)
+            try:
+                result = sample_diff_between_writes(
+                    conn,
+                    args.sample_id,
+                    args.from_write_id,
+                    args.to_write_id,
+                    args.from_seq,
+                    args.to_seq,
+                )
+            finally:
+                conn.close()
+            _print_json(result)
             return 0
 
         return 2

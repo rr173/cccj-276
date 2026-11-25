@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import urllib.parse
 from pathlib import Path
 
 SCHEMA = """
@@ -228,4 +229,22 @@ def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
         "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1')"
     )
     conn.commit()
+    return conn
+
+
+def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open an existing ledger strictly read-only.
+
+    Used by read-only audit queries: the original database file can never be
+    modified through this connection (SQLite enforces it), while TEMP tables
+    remain available for as-of-cutoff replays.  Autocommit mode keeps every
+    statement self-contained so no transaction is ever left open.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"ledger database not found: {p}")
+    uri = "file:{}?mode=ro".format(urllib.parse.quote(str(p.resolve())))
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
